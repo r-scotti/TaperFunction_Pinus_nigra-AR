@@ -1,0 +1,117 @@
+---
+title: "Stem taper analysis: Pinus nigra CREA-FL"
+author: "rs"
+date: "June, the 11th, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Normalize and check input data
+
+```{r initialize}
+data0 <-read.csv("pn4TapeR.csv")
+
+library(sqldf, quietly=T)
+# Remove data redundancy and shape as traditional mesurement tally.
+# Extract basic info
+##   dbh and h_tot are normally measured independently from profile mesurements
+##   and have to be unique values
+suppressMessages(suppressWarnings(
+Trees <- sqldf("select Id, a.Dx dbh, b.Hx h_tot from 
+               (select * from data0 where Hx=1.3) a
+               join (select * from data0 where Dx=0) b
+               using (Id)")
+))
+ntUniqeId   <- sqldf("select Id from Trees natural join (select Id, count(*) n from Trees group by Id having n>1)")
+if(nrow(ntUniqeId)>0) {print(ntUniqeId); stop("Tree Id should be unique! Stopping.")}
+
+# Separate profiles info
+Profiles <- sqldf("select Id, Dx, Hx from data0 where Hx<>1.3 and Dx>0") 
+##   when Dx=0 then Hx=h_tot, this is a spurious section!
+##   check that all Profiles are connected to a tree
+profWOtrees <- sqldf("select distinct Id from Profiles except select Id from Trees")
+if(nrow(profWOtrees)>0) {print(profWOtrees); stop("Profile Id without Tree! Stopping.")}
+
+```
+
+## Measurements check
+
+```{r check}
+# Some profiles abruptly terminate at the tip
+LastSection <- sqldf("select a.Id, a.Dx p_Dx, a.Hx p_Hx from Profiles a natural join (select Id, max(Hx) Hx from Profiles group by Id)")
+Trees2 <- sqldf("select * from Trees natural join LastSection ")
+Trees2$TipTaper <- with(Trees2, p_Dx/(h_tot-p_Hx))
+summary(Trees2$TipTaper)
+library(lattice)
+xyplot(Dx ~ Hx | Id, data0[data0$Id %in% Trees2$Id[Trees2$TipTaper>100],])
+
+```
+
+## Compute taper model parameter values
+
+```{r calibration}
+Profiles2 <- sqldf("select * from (select * from Profiles UNION select Id, dbh Dx, 1.3 Hx from Trees) order by Id, Hx")
+OutOfRangeTapering <- 3.5
+ttab <- sqldf(paste("select a.*, b.h_tot HT from Profiles2 a natural join (select * from Trees2 where TipTaper <",OutOfRangeTapering,") b" ))
+library(TapeR, quietly=T)
+# define the relative knot positions and order of splines
+knt_x = c(0.0, 0.1, 0.75, 1.0); ord_x = 4 # B-Spline knots: fix effects; order (cubic = 4)
+knt_z = c(0.0, 0.1, 1.0); ord_z = 4 # B-Spline knots: rnd effects
+tpm <- with(ttab, TapeR_FIT_LME.f(Id, Hx/HT, Dx, knt_x, ord_x, knt_z, ord_z, IdKOVb = "pdSymm"))
+tp.par <- tpm$par.lme
+# xyplot(residuals(tpm$fit.lme)~fitted(tpm$fit.lme) | tpm$fit.lme$groups$Id, type=c("p", "smooth"), grid=T, main="Taper model residuals plot (by tree)")
+xyplot(residuals(tpm$fit.lme)~fitted(tpm$fit.lme), group=tpm$fit.lme$groups$Id, type=c("p", "smooth"), grid=T, main="Taper model residuals plot (by tree)")
+```
+
+
+## Compare measured profiles with 
+##  estimates obtained using only 'dbh' and 'h_tot'
+
+```{r estimating_learning_profiles, echo=T}
+                                # {r ,fig.width=6, fig.height=4, echo=FALSE}
+d_f <- data.frame()
+stems <- unique(tpm$fit.lme$groups$Id)
+for(Id in stems){
+  Hx <- Profiles$Hx[Profiles$Id==Id]
+  Dx <- Profiles$Dx[Profiles$Id==Id]
+  dbh <- Trees$dbh[Trees$Id==Id]
+  h_tot <- Trees$h_tot[Trees$Id==Id]
+  pred_profile <- E_DHx_HmDm_HT.f(Hx=Hx, Hm=1.3, Dm=dbh, mHt=h_tot, sHt=0, par.lme=tp.par)
+ d_f <- rbind(d_f, 
+               data.frame(Id, 
+                          h_sez = Hx,
+                          g="Observed",
+                          d_sez = Dx))
+  d_f <- rbind(d_f, 
+               data.frame(Id, 
+                          h_sez = pred_profile$Hx,
+                          g="Predicted",
+                          d_sez = c(pred_profile$DHx)))
+  d_f <- rbind(d_f, 
+               data.frame(Id, 
+                          h_sez = pred_profile$Hx,
+                          g="CI_pred_l",
+                          d_sez = pred_profile$CI_Pred[,1]))
+  d_f <- rbind(d_f, 
+               data.frame(Id, 
+                          h_sez = pred_profile$Hx,
+                          g="CI_pred_u",
+                          d_sez = pred_profile$CI_Pred[,3]))
+}
+library(lattice, quietly=T)
+with(d_f, xyplot(I(d_sez[g=="Predicted"] - d_sez[g=="Observed"])~d_sez[g=="Predicted"]
+                 , group=factor(Id[g=="Predicted"])
+                 , type=c("p", "l"), auto.key=list(lines=T, points=T, space ="right")
+                 , xlab ="diametro della sezione [cm]", ylab ="Scarto [cm]"))
+
+miscSettings <- simpleTheme ( pch = c (1 , NA, NA, NA) , lty = c(0,1,2,2))
+xyplot(d_sez~h_sez|factor(Id), group=g, data=d_f, par.settings=miscSettings
+       , auto.key=list(lines=T, points=T, corner=c(0.05,0.05)), layout=c(1,3), type=c("p", "l", "l", "l")
+       , grid=T)
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
